@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+autotype - Type text into remote desktops that block clipboard paste.
+
+Simulates keyboard input via macOS AppleScript. Each line is sent as a
+single batched osascript call (all keystrokes + key codes in one tell block)
+for optimal speed without dropping characters.
+
+Usage:
+  autotype                    # read from clipboard (pbpaste)
+  autotype file.R             # read from file
+  autotype -                  # read from stdin (pipe)
+  echo "code" | autotype -    # pipe code directly
+  autotype --wait 3 file.R    # custom wait time (default: 5s)
+  autotype --delay 0.02       # per-line delay (default: 0.01s)
+
+Workflow with Claude Code:
+  1. Paste code to Claude Code
+  2. Claude writes it to /tmp/autotype_code.R
+  3. Claude runs: autotype /tmp/autotype_code.R
+  4. Switch to your remote desktop window within the wait period
+"""
+import argparse
+import subprocess
+import sys
+import time
+
+
+PAUSE_EVERY_DEFAULT = 10000 # lines between auto-pauses
+PAUSE_DURATION = 3.0        # seconds to pause
+WATCHDOG_LIMIT = 18.0       # seconds - pause before Chrome RDP's ~25-30s limit
+MAX_RETRIES = 3             # retries per osascript call on failure
+
+# Shared timer: tracks wall-clock time since last pause
+_last_pause = None
+
+
+def _watchdog_check():
+    """Auto-pause if approaching Chrome Remote Desktop's watchdog limit."""
+    global _last_pause
+    if _last_pause is None:
+        _last_pause = time.time()
+        return
+    elapsed = time.time() - _last_pause
+    if elapsed >= WATCHDOG_LIMIT:
+        print(f"  [watchdog pause {PAUSE_DURATION:.0f}s after {elapsed:.0f}s continuous]",
+              flush=True)
+        time.sleep(PAUSE_DURATION)
+        _last_pause = time.time()
+
+
+def _run_osascript(script):
+    """Run osascript with watchdog checking and retry on failure."""
+    _watchdog_check()
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            subprocess.run(["osascript", "-e", script], check=True,
+                           capture_output=True, timeout=30)
+            return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            if attempt < MAX_RETRIES:
+                wait = PAUSE_DURATION * (attempt + 1)
+                print(f"  [osascript failed, retry {attempt+1}/{MAX_RETRIES} "
+                      f"after {wait:.0f}s]", flush=True)
+                time.sleep(wait)
+                global _last_pause
+                _last_pause = time.time()
+            else:
+                raise
+
+
+def type_line(text, add_return=False):
+    """Type a line in a single batched AppleScript call.
+
+    Batches consecutive printable characters into single keystroke commands.
+    Spaces, tabs, and backslashes are sent as individual key code events.
+    Optionally appends a Return keystroke at the end.
+    """
+    parts = []
+    buffer = ""
+
+    def flush():
+        nonlocal buffer
+        if buffer:
+            escaped = buffer.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'keystroke "{escaped}"')
+            buffer = ""
+
+    for char in text:
+        if char == " ":
+            flush()
+            parts.append("key code 49")
+        elif char == "\t":
+            flush()
+            parts.append("key code 48")
+        elif char == "\\":
+            flush()
+            parts.append("key code 42")
+        elif char == ".":
+            flush()
+            parts.append("key code 47")
+        else:
+            buffer += char
+    flush()
+
+    if add_return:
+        parts.append("key code 36")
+
+    if parts:
+        body = "\n".join(parts)
+        script = f'tell application "System Events"\n{body}\nend tell'
+        _run_osascript(script)
+
+
+def read_clipboard():
+    """Read text from macOS clipboard."""
+    result = subprocess.run(["pbpaste"], capture_output=True, text=True)
+    return result.stdout
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Type text into remote desktops that block clipboard paste."
+    )
+    parser.add_argument(
+        "source", nargs="?", default=None,
+        help="File path to read, or '-' for stdin. Omit to read clipboard."
+    )
+    parser.add_argument(
+        "--wait", type=int, default=5,
+        help="Seconds to wait before typing starts (default: 5)"
+    )
+    parser.add_argument(
+        "--delay", type=float, default=0,
+        help="Delay between lines in seconds (default: 0)"
+    )
+    parser.add_argument(
+        "--pause-every", type=int, default=PAUSE_EVERY_DEFAULT,
+        help=f"Pause for {PAUSE_DURATION}s every N lines "
+             f"(default: {PAUSE_EVERY_DEFAULT}, 0 = disabled)"
+    )
+    args = parser.parse_args()
+
+    # Read code from source
+    if args.source is None:
+        code = read_clipboard()
+        source_name = "clipboard"
+    elif args.source == "-":
+        code = sys.stdin.read()
+        source_name = "stdin"
+    else:
+        with open(args.source, "r") as f:
+            code = f.read()
+        source_name = args.source
+
+    if not code.strip():
+        print("Error: No code to type.", file=sys.stderr)
+        sys.exit(1)
+
+    lines = code.split("\n")
+    # Remove trailing empty line if present (from trailing newline)
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+
+    total = len(lines)
+    print(f"Loaded {total} lines from {source_name}")
+    print(f"Switch to target window now. Typing starts in {args.wait} seconds...")
+    print("Press Ctrl+C to abort at any time.\n")
+
+    time.sleep(args.wait)
+
+    # Initialize watchdog timer
+    global _last_pause
+    _last_pause = time.time()
+
+    for i, line in enumerate(lines):
+        pct = (i + 1) / total * 100
+        preview = line[:60] + ("..." if len(line) > 60 else "")
+        print(f"[{i+1}/{total}] ({pct:.0f}%) {preview}", flush=True)
+
+        is_last = (i == total - 1)
+        type_line(line, add_return=not is_last)
+
+        if args.delay > 0:
+            time.sleep(args.delay)
+
+        # Line-based auto-pause for remote desktop safety
+        if args.pause_every > 0 and (i + 1) % args.pause_every == 0 and not is_last:
+            print(f"  [line-pause {PAUSE_DURATION:.0f}s at line {i+1}]", flush=True)
+            time.sleep(PAUSE_DURATION)
+            _last_pause = time.time()
+
+    print("\nDone! All code has been typed.", flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nAborted by user.")
+        sys.exit(1)

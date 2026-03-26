@@ -69,14 +69,22 @@ def _run_osascript(script):
                 raise
 
 
+MAX_EVENTS = 15       # max keyboard events per osascript call
+MAX_BUFFER = 12       # max chars before auto-flushing a keystroke string
+CHUNK_DELAY = 0.005   # seconds between chunks
+
+
 def type_line(text, add_return=False):
-    """Type a line in a single batched AppleScript call.
+    """Type a line via chunked AppleScript calls.
 
     Batches consecutive printable characters into single keystroke commands.
     Spaces, tabs, and backslashes are sent as individual key code events.
-    Optionally appends a Return keystroke at the end.
+    Long buffer strings are auto-flushed to keep each keystroke command short.
+    Chunks are sent in separate osascript calls capped by total keyboard
+    event count to prevent remote desktops from dropping keystrokes.
     """
     parts = []
+    events = []  # keyboard event count per part
     buffer = ""
 
     def flush():
@@ -84,32 +92,55 @@ def type_line(text, add_return=False):
         if buffer:
             escaped = buffer.replace("\\", "\\\\").replace('"', '\\"')
             parts.append(f'keystroke "{escaped}"')
+            events.append(len(buffer))
             buffer = ""
 
     for char in text:
         if char == " ":
             flush()
             parts.append("key code 49")
+            events.append(1)
         elif char == "\t":
             flush()
             parts.append("key code 48")
+            events.append(1)
         elif char == "\\":
             flush()
             parts.append("key code 42")
-        elif char == ".":
-            flush()
-            parts.append("key code 47")
+            events.append(1)
         else:
             buffer += char
+            if len(buffer) >= MAX_BUFFER:
+                flush()
     flush()
 
     if add_return:
         parts.append("key code 36")
+        events.append(1)
 
-    if parts:
-        body = "\n".join(parts)
+    if not parts:
+        return
+
+    # Split into chunks capped by total keyboard event count
+    chunks = []
+    chunk = []
+    chunk_events = 0
+    for part, ev in zip(parts, events):
+        if chunk and chunk_events + ev > MAX_EVENTS:
+            chunks.append(chunk)
+            chunk = []
+            chunk_events = 0
+        chunk.append(part)
+        chunk_events += ev
+    if chunk:
+        chunks.append(chunk)
+
+    for i, c in enumerate(chunks):
+        body = "\n".join(c)
         script = f'tell application "System Events"\n{body}\nend tell'
         _run_osascript(script)
+        if i < len(chunks) - 1:
+            time.sleep(CHUNK_DELAY)
 
 
 def read_clipboard():
